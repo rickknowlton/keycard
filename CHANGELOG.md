@@ -3,6 +3,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-02-08
+### Fixed
+- Added copyright holder to LICENSE
+- Fixed unclosed code fence in CONTRIBUTING.md
+- Added `.gitignore` (prevents `.DS_Store` and editor swap files from being committed)
+
 ## [0.2.1] - 2026-02-07
 ### Added
 - `doctor` command — health check for dependencies, config, sites, allowed roots, and www-data membership warnings

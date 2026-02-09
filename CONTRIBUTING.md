@@ -10,3 +10,4 @@ Thanks for contributing!
 ## Run tests
 ```sh
 bats test/keycard.bats
+```
