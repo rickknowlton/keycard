@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG="${KEYCARD_CONFIG:-/etc/keycard.yml}"
+LOG_TAG="keycard"
+
+die(){ echo "❌ $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Missing '$1'. Install it and try again."; }
+
+preflight(){
+  need yq
+  yq --version 2>&1 | grep -qi 'mikefarah' \
+    || die "keycard requires Mike Farah's yq (https://github.com/mikefarah/yq), not the Python yq wrapper."
+  need setfacl
+  need getfacl
+  need systemd-run
+  need systemctl
+  [[ -r "$CONFIG" ]] || die "Config not readable: $CONFIG"
+  [[ "$(id -u)" -eq 0 ]] || die "Run as root (or via sudo)."
+}
+
+# --- Config readers (via yq) -------------------------------------------------
+
+get_root(){
+  local site="$1"
+  SITE="$site" yq '.sites[env(SITE)].root // ""' "$CONFIG"
+}
+
+get_paths(){
+  local site="$1" mode="$2"
+  SITE="$site" MODE="$mode" yq '.sites[env(SITE)].modes[env(MODE)].paths // [] | .[]' "$CONFIG"
+}
+
+get_allowed_roots(){
+  yq '.allowed_roots // ["/var/www"] | .[]' "$CONFIG"
+}
+
+# --- Path resolution ----------------------------------------------------------
+
+# Pure-bash lexical path normalization.  Resolves . and .. segments and
+# collapses double slashes.  Does NOT follow symlinks — use realpath for that.
+# This exists as a safe last-resort so ../ traversals are always caught, even
+# on systems without GNU realpath -m.
+_normalize_lexical(){
+  local input="$1" result="" seg IFS='/'
+  for seg in $input; do
+    case "$seg" in
+      ''|'.') ;;
+      '..')   result="${result%/*}" ;;
+      *)      result="$result/$seg" ;;
+    esac
+  done
+  echo "${result:-/}"
+}
+
+# Resolve a path to its canonical form.  Three-tier strategy:
+#
+#   1. realpath -m  (GNU coreutils) — full resolution including symlinks;
+#      works even when the final component does not exist.  This is what
+#      runs on the production target (Linux).
+#
+#   2. realpath     (macOS / BusyBox) — full resolution including symlinks,
+#      but requires every component to exist.
+#
+#   3. _normalize_lexical — pure-bash fallback that handles . and ..
+#      segments.  Cannot resolve symlinks, but those are caught by the
+#      subsequent [[ -e ]] existence check (broken symlinks fail -e) or
+#      by realpath in tier 2 when the target exists.
+#
+# The net effect: ../ traversal is always caught, symlink escapes are
+# caught whenever the path exists, and we never operate on a raw
+# un-normalized path.
+resolve_path(){
+  realpath -m -- "$1" 2>/dev/null && return
+  realpath    -- "$1" 2>/dev/null && return
+  _normalize_lexical "$1"
+}
+
+# --- Path validation ----------------------------------------------------------
+
+# Resolve relative paths under a root dir and verify each falls under one of
+# the configured allowed_roots.  Populates the global PATHS[] array.
+#
+# - Paths are canonicalized via resolve_path (../ traversal, symlinks)
+# - Each resolved path must exist on disk
+# - Each resolved path must be at or below an allowed root
+#
+# Usage: build_validated_paths <root> <relpath> [<relpath> ...]
+build_validated_paths(){
+  local root="$1"; shift
+
+  local -a allowed_roots=()
+  while IFS= read -r _ar; do
+    allowed_roots+=("$(resolve_path "$_ar")")
+  done < <(get_allowed_roots)
+
+  PATHS=()
+  local rp
+  for rp in "$@"; do
+    [[ "$rp" != "/" ]] || die "Refusing to operate on '/'"
+
+    local P
+    P="$(resolve_path "$root/$rp")"
+
+    [[ -e "$P" ]] || die "Path does not exist: $P"
+
+    local allowed=false
+    local ar
+    for ar in "${allowed_roots[@]}"; do
+      if [[ "$P" == "$ar" || "$P" == "$ar"/* ]]; then
+        allowed=true
+        break
+      fi
+    done
+    [[ "$allowed" == "true" ]] || die "Path '$P' is not under any allowed root (${allowed_roots[*]}). Update allowed_roots in $CONFIG."
+
+    PATHS+=("$P")
+  done
+}
+
+# --- Validation ---------------------------------------------------------------
+
+validate_duration(){
+  local dur="$1"
+  # Trim leading/trailing whitespace (copy-paste tolerance).
+  # Internal spaces are still rejected — use 2h30m, not "2h 30m".
+  read -r dur <<< "$dur"
+
+  # Matches one or more <digits><suffix> groups covering all systemd.time(7) spans.
+  local pattern='^([0-9]+(usec|msec|us|ms|s|m|h|d|w|M|y|sec|min|hour|day|week|month|year|seconds|minutes|hours|days|weeks|months|years))+$'
+  if [[ ! "$dur" =~ $pattern ]]; then
+    die "Invalid duration '$dur'. Examples: 15m, 1h, 2h30m, 1day (no spaces between groups)"
+  fi
+}
+
+# --- Display ------------------------------------------------------------------
+
+usage(){
+  cat <<'EOF'
+keycard — timed filesystem unlock via ACL + systemd
+
+Usage:
+  keycard in      --site <site> --mode <mode> --who user:<name>|group:<name> --for <duration>
+  keycard out     --site <site> --mode <mode> --who user:<name>|group:<name>
+  keycard status  --site <site> --mode <mode> --who user:<name>|group:<name>
+  keycard list
+  keycard cleanup
+  keycard doctor
+
+Durations:
+  15m, 30m, 1h, 2h, 12h, 1day, 2h30m  (any systemd time span)
+
+Examples:
+  keycard in  --site myblog --mode theme      --who user:deploy --for 30m
+  keycard out --site shop   --mode wp-content --who user:deploy
+  keycard list
+  keycard cleanup
+  keycard doctor
+EOF
+  exit 1
+}
+
+logit(){ logger -t "$LOG_TAG" -- "$*"; }
+
+# --- Actions ------------------------------------------------------------------
+
+do_in(){
+  [[ -n "$DUR" ]] || die "--for is required (ex: 30m, 1h, 12h, 1day)"
+  validate_duration "$DUR"
+
+  # Grant ACL + default ACL for inheritance
+  for p in "${PATHS[@]}"; do
+    setfacl -R -m "$ACLSPEC" "$p"
+    setfacl -R -d -m "$ACLSPEC" "$p" 2>/dev/null || true
+  done
+
+  # Schedule automatic rollback using the same binary that swiped in.
+  # Resolves the currently-running script to an absolute path so the timer
+  # works regardless of install location or repo checkout.  The timer
+  # executes from / so relative paths must be resolved here.
+  local src="${BASH_SOURCE[0]}"
+  local keycard_bin
+  if command -v realpath >/dev/null 2>&1; then
+    keycard_bin="$(realpath "$src" 2>/dev/null || echo "$src")"
+  else
+    case "$src" in
+      /*) keycard_bin="$src" ;;
+      *)  keycard_bin="$PWD/$src" ;;
+    esac
+  fi
+  if [[ ! -x "$keycard_bin" ]]; then
+    keycard_bin="$(command -v keycard 2>/dev/null || echo /usr/local/bin/keycard)"
+  fi
+  systemd-run --quiet --unit "$UNIT" --on-active="$DUR" \
+    "$keycard_bin" out --site "$SITE" --mode "$MODE" --who "$WHO" || true
+
+  logit "IN site=$SITE mode=$MODE who=$WHO for=$DUR paths=${PATHS[*]}"
+  echo "✅ Swiped IN: site=$SITE mode=$MODE who=$WHO for=$DUR"
+}
+
+do_out(){
+  # Stop timer/service if present
+  systemctl stop "${UNIT}.timer" >/dev/null 2>&1 || true
+  systemctl stop "${UNIT}.service" >/dev/null 2>&1 || true
+  systemctl reset-failed "${UNIT}.timer" >/dev/null 2>&1 || true
+  systemctl reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
+
+  # Remove ACL + default ACL
+  for p in "${PATHS[@]}"; do
+    setfacl -R -x "$ACLDEL" "$p" 2>/dev/null || true
+    setfacl -R -d -x "$ACLDEL" "$p" 2>/dev/null || true
+  done
+
+  logit "OUT site=$SITE mode=$MODE who=$WHO paths=${PATHS[*]}"
+  echo "🔒 Swiped OUT: site=$SITE mode=$MODE who=$WHO"
+}
+
+do_status(){
+  echo "Site: $SITE"
+  echo "Mode: $MODE"
+  echo "Who : $WHO"
+  echo "Paths:"
+  printf "  - %s\n" "${PATHS[@]}"
+  echo
+
+  if systemctl is-active --quiet "${UNIT}.timer"; then
+    echo "Timer: ACTIVE (${UNIT}.timer)"
+    systemctl show "${UNIT}.timer" -p ActiveEnterTimestamp -p NextElapseUSecRealtime -p Result | sed 's/^/  /'
+  else
+    echo "Timer: not active (${UNIT}.timer)"
+  fi
+
+  echo
+  echo "ACL (first path):"
+  getfacl -p "${PATHS[0]}" | sed 's/^/  /' | head -n 60
+}
+
+do_doctor(){
+  local issues=0
+
+  echo "keycard doctor"
+  echo "=============="
+  echo
+
+  # --- Dependencies ---
+  echo "Dependencies:"
+
+  if command -v yq >/dev/null 2>&1; then
+    if yq --version 2>&1 | grep -qi 'mikefarah'; then
+      echo "  ✅ yq (Mike Farah's Go version)"
+    else
+      echo "  ⚠️  yq found, but not Mike Farah's Go version"
+      echo "     keycard requires: https://github.com/mikefarah/yq"
+      ((issues++))
+    fi
+  else
+    echo "  ❌ yq not found"
+    ((issues++))
+  fi
+
+  local is_linux=false
+  [[ "$(uname -s)" == "Linux" ]] && is_linux=true
+
+  for cmd in setfacl getfacl; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "  ✅ $cmd"
+    elif $is_linux; then
+      echo "  ❌ $cmd not found"
+      ((issues++))
+    else
+      echo "  ⚠️  $cmd not found (expected — requires Linux)"
+    fi
+  done
+
+  for cmd in systemd-run systemctl; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "  ✅ $cmd"
+    elif $is_linux; then
+      echo "  ❌ $cmd not found"
+      ((issues++))
+    else
+      echo "  ⚠️  $cmd not found (expected — requires Linux with systemd)"
+    fi
+  done
+
+  if command -v realpath >/dev/null 2>&1; then
+    if realpath -m / >/dev/null 2>&1; then
+      echo "  ✅ realpath (GNU, with -m support)"
+    else
+      echo "  ✅ realpath (without -m; lexical fallback will be used for non-existent paths)"
+    fi
+  else
+    echo "  ⚠️  realpath not found (pure-bash lexical normalizer will be used)"
+  fi
+
+  echo
+
+  # --- Config ---
+  echo "Config: $CONFIG"
+
+  if [[ -r "$CONFIG" ]]; then
+    echo "  ✅ readable"
+  else
+    echo "  ❌ not readable (does the file exist?)"
+    ((issues++))
+    echo
+    echo "Found $issues issue(s). Cannot continue without a config."
+    return 1
+  fi
+
+  # --- Sites ---
+  echo
+  echo "Sites:"
+
+  local site_list
+  site_list="$(yq '.sites // {} | keys | .[]' "$CONFIG" 2>/dev/null)" || true
+
+  if [[ -z "$site_list" ]]; then
+    echo "  ⚠️  no sites defined in config"
+    ((issues++))
+  else
+    while IFS= read -r site; do
+      local root
+      root="$(get_root "$site")"
+      if [[ -z "$root" ]]; then
+        echo "  ⚠️  $site: no root defined"
+        ((issues++))
+      elif [[ -d "$root" ]]; then
+        echo "  ✅ $site → $root"
+      else
+        echo "  ⚠️  $site → $root (directory does not exist)"
+        ((issues++))
+      fi
+
+      # List modes
+      local mode_list
+      mode_list="$(SITE="$site" yq '.sites[env(SITE)].modes // {} | keys | .[]' "$CONFIG" 2>/dev/null)" || true
+      if [[ -z "$mode_list" ]]; then
+        echo "     ⚠️  no modes defined"
+        ((issues++))
+      else
+        while IFS= read -r mode; do
+          echo "     mode: $mode"
+        done <<< "$mode_list"
+      fi
+    done <<< "$site_list"
+  fi
+
+  # --- Allowed roots ---
+  echo
+  echo "Allowed roots:"
+  while IFS= read -r ar; do
+    if [[ -d "$ar" ]]; then
+      echo "  ✅ $ar"
+    else
+      echo "  ⚠️  $ar (directory does not exist)"
+      ((issues++))
+    fi
+  done < <(get_allowed_roots)
+
+  # --- www-data membership check ---
+  echo
+  echo "Group membership warnings:"
+
+  local www_data_members=""
+  if getent group www-data >/dev/null 2>&1; then
+    www_data_members="$(getent group www-data | cut -d: -f4)"
+  fi
+
+  if [[ -n "$www_data_members" ]]; then
+    echo "  Users in www-data: $www_data_members"
+    echo "  ⚠️  This is only a concern if any of these are SFTP/deploy users."
+    echo "     Members of www-data may have permanent write access regardless"
+    echo "     of keycard. To fix: sudo gpasswd -d <user> www-data"
+    ((issues++))
+  else
+    echo "  ✅ No users in www-data group (or group does not exist)"
+  fi
+
+  # --- Summary ---
+  echo
+  if [[ $issues -eq 0 ]]; then
+    echo "All checks passed. You're good to go. 🎉"
+    return 0
+  else
+    echo "Found $issues potential issue(s). Review the items above."
+    return 1
+  fi
+}
+
+do_cleanup(){
+  echo "Cleaning up inactive keycard units..."
+  local count=0
+  # Only iterate over .timer units — a .service may legitimately be
+  # inactive (dead) while its .timer is still counting down.
+  while IFS= read -r timer; do
+    [[ -n "$timer" ]] || continue
+    if ! systemctl is-active --quiet "$timer"; then
+      local service="${timer%.timer}.service"
+      systemctl stop "$timer" 2>/dev/null || true
+      systemctl reset-failed "$timer" 2>/dev/null || true
+      systemctl stop "$service" 2>/dev/null || true
+      systemctl reset-failed "$service" 2>/dev/null || true
+      echo "  Removed: $timer (+ ${service})"
+      ((count++))
+    fi
+  done < <(systemctl list-units --all --no-pager --plain --no-legend 'keycard-*.timer' | awk '{print $1}')
+  if [[ $count -eq 0 ]]; then
+    echo "Nothing to clean up."
+  else
+    echo "Cleaned up $count timer(s) and associated service(s)."
+  fi
+}
+
+# --- Main ---------------------------------------------------------------------
+
+main(){
+  local ACTION="${1:-}"; shift || true
+  SITE=""; MODE=""; WHO=""; DUR=""
+
+  if [[ "$ACTION" == "list" ]]; then
+    preflight
+    systemctl list-timers --all --no-pager 'keycard-*.timer'
+    exit 0
+  fi
+
+  if [[ "$ACTION" == "cleanup" ]]; then
+    preflight
+    do_cleanup
+    exit 0
+  fi
+
+  if [[ "$ACTION" == "doctor" ]]; then
+    do_doctor
+    exit 0
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --site) SITE="$2"; shift 2;;
+      --mode) MODE="$2"; shift 2;;
+      --who)  WHO="$2"; shift 2;;
+      --for)  DUR="$2"; shift 2;;
+      *) usage;;
+    esac
+  done
+
+  [[ -n "$ACTION" ]] || usage
+  [[ -n "$SITE" && -n "$MODE" && -n "$WHO" ]] || usage
+
+  preflight
+
+  ROOT="$(get_root "$SITE")"
+  [[ -n "$ROOT" ]] || die "Unknown site '$SITE' in $CONFIG"
+
+  local -a RELPATHS=()
+  while IFS= read -r _rp; do
+    RELPATHS+=("$_rp")
+  done < <(get_paths "$SITE" "$MODE")
+  [[ "${#RELPATHS[@]}" -gt 0 ]] || die "Unknown mode '$MODE' for site '$SITE' (or no paths)."
+
+  IFS=":" read -r KIND NAME <<<"$WHO"
+  [[ "$KIND" == "user" || "$KIND" == "group" ]] || die "--who must be user:<name> or group:<name>"
+  if [[ "$KIND" == "user" ]]; then
+    id "$NAME" >/dev/null 2>&1 || die "User does not exist: $NAME"
+    ACLSPEC="u:$NAME:rwX"
+    ACLDEL="u:$NAME"
+  else
+    getent group "$NAME" >/dev/null 2>&1 || die "Group does not exist: $NAME"
+    ACLSPEC="g:$NAME:rwX"
+    ACLDEL="g:$NAME"
+  fi
+
+  build_validated_paths "$ROOT" "${RELPATHS[@]}"
+
+  UNIT="keycard-${SITE}-${MODE}-${KIND}-${NAME}"
+
+  case "$ACTION" in
+    in) do_in;;
+    out) do_out;;
+    status) do_status;;
+    *) usage;;
+  esac
+}
+
+# Allow sourcing without executing (for tests)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

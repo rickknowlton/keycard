@@ -1,0 +1,17 @@
+sites:
+  mysite:
+    root: /var/www/mysite
+    modes:
+      theme:
+        paths:
+          - wp-content/themes/mytheme
+      all:
+        paths:
+          - wp-content
+
+  other:
+    root: /var/www/other
+    modes:
+      full:
+        paths:
+          - .

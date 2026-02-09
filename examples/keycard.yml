@@ -1,0 +1,28 @@
+# Allowed root paths — keycard refuses to touch anything outside these.
+# Defaults to ["/var/www"] if omitted.
+#
+# allowed_roots:
+#   - /var/www
+#   - /opt/apps
+
+sites:
+  myblog:
+    root: /var/www/example.com
+    modes:
+      theme:
+        paths:
+          - wp-content/themes/starter-theme
+      wp-content:
+        paths:
+          - wp-content
+
+  shop:
+    root: /var/www/shop.example.com
+    modes:
+      wp-content:
+        paths:
+          - wp-content
+      # Optional: core unlock window (use carefully)
+      core:
+        paths:
+          - .

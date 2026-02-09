@@ -1,0 +1,18 @@
+allowed_roots:
+  - /var/www
+  - /opt/apps
+
+sites:
+  mysite:
+    root: /var/www/mysite
+    modes:
+      theme:
+        paths:
+          - wp-content/themes/mytheme
+
+  customapp:
+    root: /opt/apps/myapp
+    modes:
+      data:
+        paths:
+          - uploads
