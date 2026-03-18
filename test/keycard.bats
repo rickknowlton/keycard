@@ -255,6 +255,57 @@ load_keycard() {
   [[ "$output" == *"doctor"* ]]
 }
 
+@test "usage text includes version command" {
+  run bash "$KEYCARD"
+  [[ "$output" == *"version"* ]]
+}
+
+# ===========================================================================
+#  Version
+# ===========================================================================
+
+@test "version: prints version string" {
+  run bash "$KEYCARD" version
+  [ "$status" -eq 0 ]
+  [[ "$output" == "keycard "* ]]
+}
+
+@test "--version: prints version string" {
+  run bash "$KEYCARD" --version
+  [ "$status" -eq 0 ]
+  [[ "$output" == "keycard "* ]]
+}
+
+# ===========================================================================
+#  Unit name validation
+# ===========================================================================
+
+@test "validate_unit_name_part: accepts simple alphanumeric" {
+  load_keycard
+  validate_unit_name_part "Site" "my-site_01"
+}
+
+@test "validate_unit_name_part: rejects spaces" {
+  load_keycard
+  run validate_unit_name_part "Site" "my site"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid for systemd unit names"* ]]
+}
+
+@test "validate_unit_name_part: rejects slashes" {
+  load_keycard
+  run validate_unit_name_part "Mode" "wp/content"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid for systemd unit names"* ]]
+}
+
+@test "validate_unit_name_part: rejects dots" {
+  load_keycard
+  run validate_unit_name_part "Name" "user.name"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid for systemd unit names"* ]]
+}
+
 # ===========================================================================
 #  Doctor command
 # ===========================================================================

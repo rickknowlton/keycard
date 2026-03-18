@@ -3,6 +3,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-17
+### Fixed
+- `do_doctor` crash on first issue: `((issues++))` returned falsy under `set -e` when `issues` was 0 (switched to pre-increment)
+- Silent failure when systemd timer fails to schedule — now warns the user and logs
+- `uninstall.sh` timer parsing used fragile `list-timers` table output; now uses `list-units --plain --no-legend`
+- www-data group membership warning no longer inflates the doctor issue count (informational only)
+
+### Added
+- `keycard version` / `keycard --version`
+- Duplicate swipe-in detection: re-running `keycard in` for the same site/mode/who now resets the timer instead of silently failing
+- Systemd unit name validation — site, mode, and user/group names are checked for characters that are invalid in unit names
+
 ## [0.2.2] - 2026-02-08
 ### Fixed
 - Added copyright holder to LICENSE
